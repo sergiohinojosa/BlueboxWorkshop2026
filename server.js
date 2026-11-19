@@ -2,11 +2,85 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { SpanStatusCode, trace } = require('@opentelemetry/api');
 
 const port = Number(process.env.PORT || 8088);
 const paymentUrl = process.env.PAYMENT_URL || 'http://localhost:4004';
 const postgrestUrl = process.env.POSTGREST_URL || 'http://localhost:3000';
-const databasePool = [{}, {}];
+const parsePositiveInteger = (name, fallback) => {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer`);
+  return parsed;
+};
+const parseNonNegativeInteger = (name, fallback) => {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative integer`);
+  return parsed;
+};
+const databasePoolSize = parsePositiveInteger('DATABASE_POOL_SIZE', 4);
+const databasePoolMaxQueue = parseNonNegativeInteger('DATABASE_POOL_MAX_QUEUE', 100);
+const databasePoolWaitTimeoutMs = parsePositiveInteger('DATABASE_POOL_WAIT_TIMEOUT_MS', 1000);
+
+class DatabasePoolExhaustedError extends Error {
+  constructor() {
+    super('database connection pool exhausted');
+    this.name = 'DatabasePoolExhaustedError';
+  }
+}
+
+class DatabasePool {
+  constructor(size, maxQueue, waitTimeoutMs) {
+    this.size = size;
+    this.maxQueue = maxQueue;
+    this.waitTimeoutMs = waitTimeoutMs;
+    this.active = 0;
+    this.waiters = [];
+  }
+
+  get waiting() {
+    return this.waiters.length;
+  }
+
+  acquire() {
+    if (this.active < this.size) {
+      this.active += 1;
+      return Promise.resolve(this.createRelease());
+    }
+    if (this.waiters.length >= this.maxQueue) return Promise.reject(new DatabasePoolExhaustedError());
+
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        const index = this.waiters.indexOf(waiter);
+        if (index === -1) return;
+        this.waiters.splice(index, 1);
+        reject(new DatabasePoolExhaustedError());
+      }, this.waitTimeoutMs);
+      this.waiters.push(waiter);
+    });
+  }
+
+  createRelease() {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const waiter = this.waiters.shift();
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(this.createRelease());
+      } else {
+        this.active -= 1;
+      }
+    };
+  }
+}
+
+const databasePool = new DatabasePool(databasePoolSize, databasePoolMaxQueue, databasePoolWaitTimeoutMs);
 const products = [
   { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕' },
   { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓' },
@@ -19,19 +93,14 @@ const products = [
 const send = (res, status, value, type = 'application/json') => { res.writeHead(status, { 'content-type': type }); res.end(type === 'application/json' ? JSON.stringify(value) : value); };
 const readBody = req => new Promise((resolve, reject) => { let value = ''; req.on('data', chunk => { value += chunk; }); req.on('end', () => resolve(value ? JSON.parse(value) : {})); req.on('error', reject); });
 const database = async (url, options = {}) => {
-  const connection = databasePool.pop();
-  if (!connection) {
-    console.error(JSON.stringify({ event: 'database_pool_exhausted', poolSize: 2, databaseUrl: url }));
-    throw new Error('database connection pool exhausted');
-  }
+  const release = await databasePool.acquire();
   try {
-    await new Promise(resolve => setTimeout(resolve, 250));
     const response = await fetch(`${postgrestUrl}${url}`, { ...options, headers: { accept: 'application/json', 'content-type': 'application/json', ...(options.headers || {}) } });
     const text = await response.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch { data = { message: text }; }
     if (!response.ok) throw new Error(data?.message || data?.details || `Database request failed: ${response.status}`);
     return data;
   } finally {
-    databasePool.push(connection);
+    release();
   }
 };
 const mapProduct = product => ({ ...product, priceCents: product.price_cents, price_cents: undefined });
@@ -71,4 +140,31 @@ async function route(req, res, url) {
   if (url.pathname === '/styles.css') return send(res, 200, fs.readFileSync(path.join(__dirname, 'frontend/styles.css'), 'utf8'), 'text/css');
   return send(res, 404, { error: 'Not found' });
 }
-http.createServer((req, res) => route(req, res, new URL(req.url, `http://${req.headers.host}`)).catch(error => { console.error(error); send(res, 500, { error: error.message }); })).listen(port, () => console.log(`shop API and frontend running at http://localhost:${port}`));
+const server = http.createServer((req, res) => route(req, res, new URL(req.url, `http://${req.headers.host}`)).catch(error => {
+  const message = error instanceof Error ? error.message : String(error);
+  const span = trace.getActiveSpan();
+  if (span) {
+    span.recordException(error instanceof Error ? error : new Error(message));
+    span.setStatus({ code: SpanStatusCode.ERROR, message });
+  }
+  if (error instanceof DatabasePoolExhaustedError) {
+    console.error(JSON.stringify({
+      event: 'database_pool_exhausted',
+      poolSize: databasePool.size,
+      queuedRequests: databasePool.waiting,
+      waitTimeoutMs: databasePool.waitTimeoutMs,
+      message,
+    }));
+    res.setHeader('Retry-After', '1');
+    send(res, 503, { error: 'Service temporarily overloaded' });
+    return;
+  }
+  console.error(error);
+  send(res, 500, { error: message });
+}));
+
+if (require.main === module) {
+  server.listen(port, () => console.log(`shop API and frontend running at http://localhost:${server.address().port}`));
+}
+
+module.exports = server;
